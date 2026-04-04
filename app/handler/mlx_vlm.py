@@ -271,9 +271,12 @@ class MLXVLMHandler:
         cache_inserted = False
 
         try:
-            input_prompt, model_params, parsers_result, cache_info = (
-                await self._build_inference_context(request)
-            )
+            (
+                input_prompt,
+                model_params,
+                parsers_result,
+                cache_info,
+            ) = await self._build_inference_context(request)
 
             cache = cache_info["prompt_cache"]
             cache_key = cache_info["cache_key"]
@@ -500,7 +503,9 @@ class MLXVLMHandler:
 
             # Use original total_input_tokens for text-only (includes cached),
             # fall back to chunk-reported prompt_tokens for multimodal.
-            prompt_tokens = total_input_tokens if total_input_tokens > 0 else final_chunk.prompt_tokens
+            prompt_tokens = (
+                total_input_tokens if total_input_tokens > 0 else final_chunk.prompt_tokens
+            )
             total_tokens = prompt_tokens + final_chunk.generation_tokens
 
             # Persist prompt cache for text-only requests
@@ -572,9 +577,12 @@ class MLXVLMHandler:
             str: Complete response.
         """
         try:
-            input_prompt, model_params, parsers_result, cache_info = (
-                await self._build_inference_context(request)
-            )
+            (
+                input_prompt,
+                model_params,
+                parsers_result,
+                cache_info,
+            ) = await self._build_inference_context(request)
             cache = cache_info["prompt_cache"]
             cache_key = cache_info["cache_key"]
             total_input_tokens = cache_info["total_input_tokens"]
