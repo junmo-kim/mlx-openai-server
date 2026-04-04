@@ -187,8 +187,8 @@ Create a YAML file with a `server` section (host, port, logging) and a `models` 
 | `served_model_name` | No | ID used in API requests; defaults to `model_path` if omitted |
 | `context_length` | No | Max context length (lm / multimodal) |
 | `queue_timeout`, `queue_size` | No | Per-model queue settings |
-| `prompt_cache_size` | No | Max prompt KV cache entries (lm only; default: 10) |
-| `prompt_cache_max_bytes` | No | Max total bytes for prompt KV caches before eviction (lm only) |
+| `prompt_cache_size` | No | Max prompt KV cache entries (lm / multimodal text-only; default: 10) |
+| `prompt_cache_max_bytes` | No | Max total bytes for prompt KV caches before eviction (lm / multimodal text-only) |
 | `on_demand` | No | Enable dynamic swapping — model is loaded on first request, unloaded after idle (default: `false`) |
 | `on_demand_idle_timeout` | No | Seconds to wait before unloading an idle on-demand model (default: `60`) |
 
