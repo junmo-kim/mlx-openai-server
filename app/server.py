@@ -256,6 +256,8 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
                 trust_remote_code=model_cfg.trust_remote_code,
                 chat_template_file=model_cfg.chat_template_file,
                 debug=model_cfg.debug,
+                prompt_cache_size=model_cfg.prompt_cache_size,
+                prompt_cache_max_bytes=model_cfg.prompt_cache_max_bytes,
             ),
             model_cfg,
         )
