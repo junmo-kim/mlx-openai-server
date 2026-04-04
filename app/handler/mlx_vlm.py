@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import HTTPException
 from loguru import logger
 import mlx.core as mx
+from mlx_lm.models.cache import trim_prompt_cache
 from mlx_vlm.video_generate import process_vision_info
 import torch
 
@@ -197,6 +198,11 @@ class MLXVLMHandler:
             cache_key = input_ids_list[:]
 
             cached, rest_input_ids = self.prompt_cache.fetch_nearest_cache(input_ids_list)
+            if cached is not None and not rest_input_ids:
+                # Exact match — trim cache by 1 so the model has at least
+                # one input token to start generation from.
+                trim_prompt_cache(cached, 1)
+                rest_input_ids = input_ids_list[-1:]
             total_remaining_tokens = len(rest_input_ids)
             if cached is not None:
                 prompt_cache = cached
