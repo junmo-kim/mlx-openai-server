@@ -21,9 +21,11 @@ from ..schemas.openai import (
     ChatCompletionContentPartInputAudio,
     ChatCompletionContentPartVideo,
     ChatCompletionRequest,
+    PromptTokenUsageInfo,
     UsageInfo,
 )
 from ..utils.debug_logging import (
+    log_debug_cache_stats,
     log_debug_model_dispatch,
     log_debug_parser_event,
     log_debug_prompt,
@@ -33,6 +35,7 @@ from ..utils.debug_logging import (
     log_debug_tool_call_emission,
 )
 from ..utils.errors import create_error_response
+from ..utils.prompt_cache import LRUPromptCache
 
 
 class MLXVLMHandler:
@@ -56,6 +59,8 @@ class MLXVLMHandler:
         trust_remote_code: bool = False,
         chat_template_file: str = None,
         debug: bool = False,
+        prompt_cache_size: int = 10,
+        prompt_cache_max_bytes: int = 1 << 63,
     ):
         """
         Initialize the handler with the specified model path.
@@ -70,6 +75,8 @@ class MLXVLMHandler:
             reasoning_parser (str): Name of the reasoning parser to use (qwen3, qwen3_next, glm4_moe, harmony, minimax, ...).
             trust_remote_code (bool): Enable trust_remote_code when loading models.
             chat_template_file (str): Path to a custom chat template file.
+            prompt_cache_size (int): Maximum number of prompt KV cache entries to store. Default is 10.
+            prompt_cache_max_bytes (int): Maximum total bytes retained by prompt KV caches before eviction.
         """
         self.model_path = model_path
         self.model = MLX_VLM(
@@ -96,6 +103,10 @@ class MLXVLMHandler:
         )
         # Debug mode
         self.debug = debug
+        self.prompt_cache = LRUPromptCache(
+            max_size=prompt_cache_size,
+            max_bytes=prompt_cache_max_bytes,
+        )
 
         # Dedicated inference thread — keeps the event loop free during
         # blocking MLX model computation.
@@ -145,10 +156,13 @@ class MLXVLMHandler:
 
     async def _build_inference_context(
         self, request: ChatCompletionRequest
-    ) -> tuple[str, dict[str, Any], Any]:
+    ) -> tuple[str, dict[str, Any], Any, dict[str, Any]]:
         """Build the common inference context shared by stream and non-stream paths.
 
-        Returns a tuple of (input_prompt, model_params, parsers_result).
+        Returns a tuple of (input_prompt, model_params, parsers_result, cache_info).
+        ``cache_info`` contains prompt-cache state for text-only requests:
+        ``prompt_cache``, ``cache_key``, ``total_input_tokens``, and
+        ``total_cached_tokens``.  For multimodal requests these are all ``None``/0.
         """
         request_dict = await self._prepare_multimodal_request(request)
 
@@ -168,6 +182,43 @@ class MLXVLMHandler:
 
         if self.debug:
             log_debug_request(request_dict)
+
+        # --- Prompt cache for text-only requests ---
+        is_text_only = not image_inputs and not video_inputs
+        prompt_cache = None
+        cache_key: list[int] | None = None
+        total_input_tokens = 0
+        total_cached_tokens = 0
+
+        if is_text_only and "input_ids" in vision_inputs:
+            input_ids_array = vision_inputs["input_ids"]
+            input_ids_list = input_ids_array.flatten().tolist()
+            total_input_tokens = len(input_ids_list)
+            cache_key = input_ids_list[:]
+
+            cached, rest_input_ids = self.prompt_cache.fetch_nearest_cache(input_ids_list)
+            total_remaining_tokens = len(rest_input_ids)
+            if cached is not None:
+                prompt_cache = cached
+                total_cached_tokens = total_input_tokens - total_remaining_tokens
+                # Replace input_ids with only the remaining (uncached) tokens
+                vision_inputs["input_ids"] = mx.array(rest_input_ids).reshape(1, -1)
+                if "attention_mask" in vision_inputs:
+                    vision_inputs["attention_mask"] = mx.ones(
+                        (1, total_remaining_tokens), dtype=vision_inputs["attention_mask"].dtype
+                    )
+            else:
+                prompt_cache = self.model.create_prompt_cache()
+
+            if self.debug:
+                log_debug_cache_stats(total_input_tokens, total_remaining_tokens)
+
+        cache_info: dict[str, Any] = {
+            "prompt_cache": prompt_cache,
+            "cache_key": cache_key,
+            "total_input_tokens": total_input_tokens,
+            "total_cached_tokens": total_cached_tokens,
+        }
 
         model_params = {
             "seed": request_dict.get("seed"),
@@ -197,7 +248,7 @@ class MLXVLMHandler:
             parsers_result.tool_parser = None
             parsers_result.unified_parser = None
 
-        return input_prompt, model_params, parsers_result
+        return input_prompt, model_params, parsers_result, cache_info
 
     async def generate_multimodal_stream(self, request: ChatCompletionRequest):  # noqa: C901
         """
@@ -209,11 +260,19 @@ class MLXVLMHandler:
         Returns:
             AsyncGenerator: Yields response chunks.
         """
+        cache: list[Any] | None = None
+        cache_key: list[int] | None = None
+        cache_inserted = False
 
         try:
-            input_prompt, model_params, parsers_result = await self._build_inference_context(
-                request
+            input_prompt, model_params, parsers_result, cache_info = (
+                await self._build_inference_context(request)
             )
+
+            cache = cache_info["prompt_cache"]
+            cache_key = cache_info["cache_key"]
+            total_input_tokens = cache_info["total_input_tokens"]
+            total_cached_tokens = cache_info["total_cached_tokens"]
 
             if self.debug:
                 log_debug_model_dispatch(
@@ -224,6 +283,7 @@ class MLXVLMHandler:
             response_generator = self.inference_worker.submit_stream(
                 self.model,
                 prompt=input_prompt,
+                prompt_cache=cache,
                 stream=True,
                 verbose=self.debug,
                 **model_params,
@@ -245,6 +305,8 @@ class MLXVLMHandler:
                     final_chunk = chunk
                     text = chunk.text
                     raw_text += text
+                    if cache_key is not None:
+                        cache_key.append(chunk.token)
 
                     if self.debug:
                         log_debug_parser_event(
@@ -292,6 +354,8 @@ class MLXVLMHandler:
                     final_chunk = chunk
                     text = chunk.text
                     raw_text += text
+                    if cache_key is not None:
+                        cache_key.append(chunk.token)
                     if is_first_chunk:
                         if reasoning_parser and hasattr(
                             reasoning_parser, "needs_redacted_reasoning_prefix"
@@ -428,25 +492,39 @@ class MLXVLMHandler:
 
                         yield text
 
-            total_tokens = final_chunk.prompt_tokens + final_chunk.generation_tokens
+            # Use original total_input_tokens for text-only (includes cached),
+            # fall back to chunk-reported prompt_tokens for multimodal.
+            prompt_tokens = total_input_tokens if total_input_tokens > 0 else final_chunk.prompt_tokens
+            total_tokens = prompt_tokens + final_chunk.generation_tokens
+
+            # Persist prompt cache for text-only requests
+            if cache is not None and cache_key is not None:
+                self.prompt_cache.insert_cache(cache_key, cache)
+                cache_inserted = True
 
             if self.debug:
+                if cache_key is not None:
+                    self.prompt_cache.log_cache_stats()
                 log_debug_raw_text_response(raw_text)
                 log_debug_stats(
-                    final_chunk.prompt_tokens,
+                    prompt_tokens,
                     final_chunk.generation_tokens,
                     total_tokens,
                     final_chunk.generation_tps,
                     final_chunk.peak_memory,
                 )
 
-            yield {
-                "__usage__": UsageInfo(
-                    prompt_tokens=final_chunk.prompt_tokens,
-                    completion_tokens=final_chunk.generation_tokens,
-                    total_tokens=total_tokens,
-                )
+            usage_kwargs: dict[str, Any] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": final_chunk.generation_tokens,
+                "total_tokens": total_tokens,
             }
+            if total_cached_tokens > 0:
+                usage_kwargs["prompt_tokens_details"] = PromptTokenUsageInfo(
+                    cached_tokens=total_cached_tokens
+                )
+
+            yield {"__usage__": UsageInfo(**usage_kwargs)}
 
         except asyncio.QueueFull:
             logger.error("Too many requests. Service is at capacity.")
@@ -465,6 +543,16 @@ class MLXVLMHandler:
                 HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             raise HTTPException(status_code=500, detail=content)
+        finally:
+            if cache is not None and cache_key is not None and not cache_inserted:
+                try:
+                    self.prompt_cache.insert_cache(cache_key, cache)
+                    if self.debug:
+                        self.prompt_cache.log_cache_stats()
+                except Exception as cache_error:
+                    logger.warning(
+                        f"Failed to persist prompt cache during stream finalization: {cache_error}"
+                    )
 
     async def generate_multimodal_response(self, request: ChatCompletionRequest):
         """
@@ -478,9 +566,13 @@ class MLXVLMHandler:
             str: Complete response.
         """
         try:
-            input_prompt, model_params, parsers_result = await self._build_inference_context(
-                request
+            input_prompt, model_params, parsers_result, cache_info = (
+                await self._build_inference_context(request)
             )
+            cache = cache_info["prompt_cache"]
+            cache_key = cache_info["cache_key"]
+            total_input_tokens = cache_info["total_input_tokens"]
+            total_cached_tokens = cache_info["total_cached_tokens"]
 
             if self.debug:
                 log_debug_model_dispatch(
@@ -491,6 +583,7 @@ class MLXVLMHandler:
             response = await self.inference_worker.submit(
                 self.model,
                 prompt=input_prompt,
+                prompt_cache=cache,
                 stream=False,
                 verbose=self.debug,
                 **model_params,
@@ -559,7 +652,14 @@ class MLXVLMHandler:
             else:
                 parsed_response["content"] = response_text
 
-            total_tokens = response.prompt_tokens + response.generation_tokens
+            prompt_tokens = total_input_tokens if total_input_tokens > 0 else response.prompt_tokens
+            total_tokens = prompt_tokens + response.generation_tokens
+
+            # Persist prompt cache for text-only requests
+            if cache is not None and cache_key is not None:
+                if response.tokens:
+                    cache_key += response.tokens
+                self.prompt_cache.insert_cache(cache_key, cache)
 
             if self.debug and isinstance(parsed_response.get("tool_calls"), list):
                 for tool_call in parsed_response["tool_calls"]:
@@ -571,22 +671,28 @@ class MLXVLMHandler:
                         )
 
             if self.debug:
+                if cache_key is not None:
+                    self.prompt_cache.log_cache_stats()
                 log_debug_raw_text_response(response.text)
                 log_debug_stats(
-                    response.prompt_tokens,
+                    prompt_tokens,
                     response.generation_tokens,
                     total_tokens,
                     response.generation_tps,
                     response.peak_memory,
                 )
 
-            usage = UsageInfo(
-                prompt_tokens=response.prompt_tokens,
-                completion_tokens=response.generation_tokens,
-                total_tokens=total_tokens,
-            )
+            usage_kwargs: dict[str, Any] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": response.generation_tokens,
+                "total_tokens": total_tokens,
+            }
+            if total_cached_tokens > 0:
+                usage_kwargs["prompt_tokens_details"] = PromptTokenUsageInfo(
+                    cached_tokens=total_cached_tokens
+                )
 
-            return {"response": parsed_response, "usage": usage}
+            return {"response": parsed_response, "usage": UsageInfo(**usage_kwargs)}
 
         except asyncio.QueueFull:
             logger.error("Too many requests. Service is at capacity.")
